@@ -19,6 +19,6 @@ Powered by an ESP32-S3 microcontroller, this project replaces the original "dumb
 ## 🛠️ Hardware Requirements
 
 * **Board:** ESP32-S3-Touch-LCD-2.8 by Waveshare (display ST7789V (320x240) with CST328 Touch Controller and Speakers)
-* **Sensors:** BME280 (Temperature, Humidity, Pressure) via I2C
+* **Sensors:** BME280, 5V type (Temperature, Humidity, Pressure) via I2C
 * **Relays/Outputs:** Solid State Relays (SSR) for the heating element and for the fan
 * **Silicone Wires:** Use only High Temperature resistant Silicone Wires for Heater and Fan 16AWG (1.3mm2) and for temp. sensor 18AWG (0.8mm2)
