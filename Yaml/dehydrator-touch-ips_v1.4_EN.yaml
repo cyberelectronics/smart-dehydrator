@@ -1,0 +1,892 @@
+esphome:
+  name: dehydrator-touch
+  friendly_name: "Smart Dehydrator"
+  on_boot:
+    priority: -100 
+    then:
+      - output.set_level: {id: backlight_pwm, level: 1.0}
+      - lambda: |-
+          if (id(target_time_min) < 30) id(target_time_min) = 600; 
+          if (id(target_temp) < 20) id(target_temp) = 50.0;
+          auto call = id(aszalo_thermostat).make_call();
+          call.set_target_temperature(id(target_temp));
+          call.set_mode(CLIMATE_MODE_OFF);
+          call.perform();
+      - delay: 1s
+      - lambda: |-
+          id(offline_timer_script).stop();
+          id(cool_down_script).stop();
+          id(fan_relay).turn_off();
+          
+      - script.execute: startup_logic
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: arduino
+  partitions: default_16MB.csv
+  
+psram:
+  mode: octal
+
+external_components:
+  - source: github://BluetriX/esphome-CST328-Touch
+    components: [ cst328 ]
+
+# --- BASIC SETTINGS (WiFi, HA connection, etc.) ---
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid_h
+      password: !secret wifi_password_h
+  ap:
+    ssid: "Dehydrator-WiFi-Setup"
+    ap_timeout: 5s 
+    
+  reboot_timeout: 0s
+  
+logger:
+  level: INFO 
+
+captive_portal:
+  id: my_captive_portal
+
+web_server:
+  port: 80
+  version: 3
+  include_internal: true
+
+# MQTT:
+mqtt:
+  broker: 192.168.50.190  # replace with your HA IP
+  username: "mqtt_aszalo" # your User
+  password: "123456789"   # your Pass
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+
+# 1. I2S BUS
+i2s_audio:
+  - id: i2s_bus
+    i2s_bclk_pin: GPIO48
+    i2s_lrclk_pin: GPIO38
+
+# 2. PHYSICAL SPEAKER
+speaker:
+  - platform: i2s_audio
+    id: aszalo_hw_speaker
+    i2s_audio_id: i2s_bus
+    i2s_dout_pin: GPIO47
+    dac_type: external
+
+# 3. OFFLINE BUZZER
+rtttl:
+  id: alarm_buzzer
+  speaker: aszalo_hw_speaker
+
+# --- GLOBAL VARIABLES ---
+globals:
+  - id: target_temp
+    type: float
+    restore_value: yes
+    initial_value: '50.0'
+  - id: target_time_min
+    type: int
+    restore_value: yes
+    initial_value: '600'
+  - id: remaining_time_s
+    type: int
+    initial_value: '0'
+  - id: backlight_state
+    type: bool
+    initial_value: 'true'
+  - id: system_error_code 
+    type: int
+    initial_value: '0'
+  - id: boot_screen_shown
+    type: bool
+    initial_value: 'false'
+  - id: wifi_connected_flag
+    type: bool
+    initial_value: 'false'
+  - id: wifi_setup_requested
+    type: bool
+    initial_value: 'false'
+
+# --- SCRIPTS ---
+script:
+  - id: startup_logic
+    mode: single
+    then:
+      - wait_until:
+          condition:
+            or:
+              - wifi.connected:
+              - lambda: 'return id(wifi_setup_requested);'
+          timeout: 15s
+          
+      - if:
+          condition:
+            lambda: 'return id(wifi_setup_requested);'
+          then:
+            - lambda: |-
+                lv_label_set_text(id(ui_boot_label), "Setup Mode Active\nConnect to SSID:\nDehydrator WiFi Setup");
+                lv_obj_add_flag(id(ui_wifi_btn), LV_OBJ_FLAG_HIDDEN);
+                
+          else:
+            - if:
+                condition:
+                  wifi.connected:
+                then:
+                  - lambda: |-
+                      std::string ip = network::get_ip_addresses().size() > 0 ? network::get_ip_addresses()[0].str() : "0.0.0.0";
+                      lv_label_set_text_fmt(id(ui_boot_label), "Connected\nIP: %s", ip.c_str());
+                      lv_obj_add_flag(id(ui_wifi_btn), LV_OBJ_FLAG_HIDDEN);
+                  - delay: 4s
+                  - lambda: 'lv_obj_add_flag(id(ui_boot_screen), LV_OBJ_FLAG_HIDDEN);'
+                
+                else:
+                  - wifi.disable:
+                  - lambda: 'lv_obj_add_flag(id(ui_boot_screen), LV_OBJ_FLAG_HIDDEN);'
+
+  - id: screen_timeout_script
+    mode: restart
+    then:
+      - output.set_level: {id: backlight_pwm, level: 1.0}
+      - lambda: "id(backlight_state) = true;"
+
+  - id: offline_timer_script
+    mode: restart
+    then:
+      - script.execute: screen_timeout_script
+      - switch.turn_on: fan_relay
+      - climate.control: 
+          id: aszalo_thermostat
+          mode: HEAT
+          target_temperature: !lambda "return id(target_temp);"
+      - lambda: "id(remaining_time_s) = id(target_time_min) * 60;"
+      - while:
+          condition:
+            lambda: "return id(remaining_time_s) > 0;"
+          then:
+            - delay: 1s
+            - lambda: "id(remaining_time_s) -= 1;"
+      - script.execute: cool_down_script
+
+  - id: cool_down_script
+    mode: restart 
+    then:
+      - climate.control: {id: aszalo_thermostat, mode: "OFF"}
+      - delay: 2min
+      - switch.turn_off: fan_relay
+
+  - id: emergency_stop
+    then:
+      - climate.control: {id: aszalo_thermostat, mode: "OFF"}
+      - switch.turn_off: fan_relay
+      - output.set_level: {id: backlight_pwm, level: 1.0}
+  
+  - id: save_data_script
+    mode: restart 
+    then:
+      - delay: 5s
+      - lambda: |-
+          if (id(aszalo_thermostat).target_temperature != id(target_temp)) {
+            auto call = id(aszalo_thermostat).make_call();
+            call.set_target_temperature(id(target_temp));
+            call.perform();
+            id(ha_target_temp).publish_state(id(target_temp));
+          }
+          id(ha_target_time).publish_state(id(target_time_min));
+          global_preferences->sync();
+          ESP_LOGI("SAVE", "Data saved after 5 seconds of inactivity!");
+        
+  - id: alarm_sensor_script
+    mode: single
+    then:
+      - rtttl.play:
+          id: alarm_buzzer
+          rtttl: "siren:d=8,o=5,b=100:d,e,d,e,d,e,d,e"
+
+  - id: alarm_thermal_script
+    mode: single
+    then:
+      - while:
+          condition:
+            lambda: 'return true;' 
+          then:
+            - rtttl.play:
+                id: alarm_buzzer
+                rtttl: "siren:d=8,o=5,b=100:d,e,d,e,d,e,d,e"
+            - delay: 3s 
+
+# --- BUS & DISPLAY CONFIG ---
+i2c:
+  - id: touch_i2c
+    sda: GPIO1
+    scl: GPIO3
+    scan: true
+    frequency: 400kHz
+  - id: bme_i2c
+    sda: GPIO11
+    scl: GPIO10
+    scan: true
+
+spi:
+  clk_pin: GPIO40
+  mosi_pin: GPIO45
+
+display:
+  - platform: st7789v
+    id: my_display
+    model: CUSTOM
+    height: 320
+    width: 240
+    offset_height: 0
+    offset_width: 0
+    cs_pin: GPIO42
+    dc_pin: GPIO41
+    reset_pin: GPIO39
+    backlight_pin: no 
+    rotation: 90
+    update_interval: 500ms  
+
+touchscreen:
+  - platform: cst328
+    id: my_touch
+    i2c_id: touch_i2c
+    interrupt_pin: 
+      number: GPIO4
+      mode: INPUT_PULLUP
+    reset_pin: GPIO2
+  
+    calibration:
+      x_min: 0
+      x_max: 320
+      y_min: 0
+      y_max: 240
+      
+    transform:
+      swap_xy: true
+      mirror_x: false
+      mirror_y: true
+
+# --- OUTPUTS ---
+output:
+  - platform: ledc
+    pin: GPIO5
+    id: backlight_pwm
+  - platform: slow_pwm
+    pin: GPIO18
+    id: heater_pwm
+    period: 5s 
+
+switch:
+  - platform: gpio
+    pin: GPIO15
+    name: "Fan"
+    id: fan_relay
+    restore_mode: ALWAYS_OFF
+    
+  - platform: template
+    name: "Dehydration Start/Stop"
+    id: ha_start_stop_switch
+    icon: "mdi:play-stop" 
+    lambda: |-
+      return id(aszalo_thermostat).mode == CLIMATE_MODE_HEAT;
+    turn_on_action:
+      - if:
+          condition:
+            lambda: "return !id(fan_relay).state;"
+          then:
+            - script.execute: offline_timer_script
+    turn_off_action:
+      - script.execute: cool_down_script
+
+# --- SENSORS ---
+sensor:
+  - platform: bme280_i2c
+    i2c_id: bme_i2c
+    address: 0x76
+    temperature: 
+      id: aszalo_temp
+      name: "Temperature"
+      filters:
+        - timeout: 5s  
+    humidity: 
+      id: aszalo_hum
+      name: "Humidity"
+      filters:
+        - timeout: 5s  
+    pressure: {id: aszalo_press, name: "Pressure"}
+    update_interval: 2s
+    
+  - platform: template
+    name: "Heating Intensity"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    lambda: |-
+      float intensity = id(aszalo_thermostat).get_output_value() * 100.0f;
+      if (intensity < 0.0f) return 0.0f;
+      if (intensity > 100.0f) return 100.0f;
+      return intensity;
+    update_interval: 5s
+
+  - platform: template
+    name: "Dehydrator Error Code"
+    id: system_error_state
+    icon: "mdi:alert-circle"
+    accuracy_decimals: 0
+    lambda: 'return id(system_error_code);'
+    update_interval: 1s
+
+# --- PID THERMOSTAT ---
+climate:
+  - platform: pid
+    name: "PID Controller"
+    id: aszalo_thermostat
+    sensor: aszalo_temp
+    default_target_temperature: 50.0
+    visual:
+      min_temperature: 20
+      max_temperature: 75
+      temperature_step: 1.0
+    heat_output: heater_pwm
+    control_parameters: {kp: 0.05, ki: 0.001, kd: 0.02}
+    on_state:
+      then:
+        - lambda: |-
+            if (!id(save_data_script).is_running()) {
+              float current_target = id(aszalo_thermostat).target_temperature;
+              if (id(target_temp) != current_target) {
+                id(target_temp) = current_target;
+                global_preferences->sync();
+                id(ha_target_temp).publish_state(current_target);
+              }
+            }
+            
+            if (id(aszalo_thermostat).mode == CLIMATE_MODE_HEAT) {
+               if (!id(fan_relay).state) {
+                 id(offline_timer_script).execute();
+               }
+            }
+            else if (id(aszalo_thermostat).mode == CLIMATE_MODE_OFF) {
+               if (id(system_error_code) != 2 && id(fan_relay).state && !id(cool_down_script).is_running()) {
+                 id(cool_down_script).execute();
+               }
+            }
+
+# --- HA HELPER SENSORS & SLIDERS ---
+number:
+  - platform: template
+    name: "Target Temperature"
+    id: ha_target_temp
+    min_value: 20
+    max_value: 75
+    step: 1
+    unit_of_measurement: "°C"
+    mode: SLIDER
+    lambda: "return id(aszalo_thermostat).target_temperature;"
+    set_action:
+      then:
+        - lambda: |-
+            auto call = id(aszalo_thermostat).make_call();
+            call.set_target_temperature(x);
+            call.perform();
+            id(target_temp) = x;
+            global_preferences->sync();
+            id(ha_target_temp).publish_state(x);
+
+  - platform: template
+    name: "Timer (Minutes)"
+    id: ha_target_time
+    min_value: 30
+    max_value: 1440
+    step: 30
+    mode: SLIDER
+    lambda: "return (float)id(target_time_min);"
+    set_action:
+      then:
+        - lambda: |-
+            id(target_time_min) = (int)x;
+            id(ha_target_time).publish_state(x); 
+            global_preferences->sync();
+
+text_sensor:
+  - platform: template
+    name: "Set Duration"
+    id: ha_set_time_text
+    icon: "mdi:clock-outline"
+    update_interval: 0.5s 
+    lambda: |-
+      int h = id(target_time_min) / 60;
+      int m = id(target_time_min) % 60;
+      char buffer[32];
+      sprintf(buffer, "%d h %02d min", h, m);
+      return {buffer};
+
+  - platform: template
+    name: "Remaining Time"
+    id: ha_remaining_time
+    icon: "mdi:timer-sand"
+    update_interval: 2s
+    lambda: |-
+      if (id(aszalo_thermostat).mode == CLIMATE_MODE_OFF) {
+        return {"Standby"};
+      }
+      int h = id(remaining_time_s) / 3600;
+      int m = (id(remaining_time_s) % 3600) / 60;
+      char buffer[20];
+      sprintf(buffer, "%02d:%02d left", h, m);
+      return {buffer};
+
+# --- FONTS ---
+font:
+  - file: "Arial.ttf"
+    id: font_huge
+    size: 38 
+    glyphs: "0123456789°%:.+-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ▲▼"
+  - file: "Arial.ttf"
+    id: font_large
+    size: 28
+    glyphs: "0123456789°%:.+-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ▲▼"
+  - file: "Arial.ttf"
+    id: font_vert
+    size: 20
+    glyphs: "0123456789°%:.+-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ▲▼"
+
+
+# --- LVGL UI ---
+lvgl:
+  displays:
+    - my_display
+  touchscreens:
+    - my_touch
+  
+  pages:
+    - id: main_page
+      bg_color: 0x000000 
+      widgets:
+        - bar:
+            id: ui_left_bar
+            x: 0
+            y: 0
+            width: 40
+            height: 240
+            min_value: 0
+            max_value: 100
+            value: 0
+            bg_color: 0x222222
+            radius: 0
+            widgets:
+              - label:
+                  id: ui_left_bar_label
+                  text: "0\n%\n\nP"
+                  align: CENTER
+                  text_align: CENTER 
+                  text_color: 0xFFFFFF
+                  text_font: font_vert
+
+        - bar:
+            id: ui_right_bar
+            x: 280
+            y: 0
+            width: 40
+            height: 240
+            min_value: 10
+            max_value: 20
+            value: 10
+            bg_color: 0x222222
+            radius: 0
+            widgets:
+              - label:
+                  id: ui_right_bar_label
+                  text: "--\n%\n\nH"
+                  align: CENTER
+                  text_align: CENTER 
+                  text_color: 0xFFFFFF
+                  text_font: font_vert
+
+        - obj:
+            id: ui_bg_temp_set
+            x: 45
+            y: 5
+            width: 110
+            height: 160 
+            bg_color: 0x000000
+            border_width: 1
+            border_color: 0x444444
+            radius: 0
+            pad_all: 0
+            scrollbar_mode: "OFF" 
+            widgets:
+              - obj: 
+                  align: TOP_MID
+                  width: 108 
+                  height: 45 
+                  bg_color: 0x000000 
+                  border_width: 0 
+                  radius: 0
+                  pad_all: 0
+                  scrollbar_mode: "OFF"
+                  widgets:
+                    - label: { text: "▲", align: CENTER, text_font: font_huge, text_color: 0xFFA500 }
+                  on_press: 
+                    - lambda: |-
+                        id(target_temp) = min(75.0f, id(target_temp) + 1.0f);
+                        lv_label_set_text_fmt(id(ui_target_temp), "%d°", (int)id(target_temp));
+                        id(save_data_script).execute();
+              - label: 
+                  id: ui_target_temp
+                  text: "50°"
+                  align: CENTER
+                  text_font: font_huge
+                  text_color: 0xFFFFFF
+              - obj: 
+                  align: BOTTOM_MID
+                  width: 108 
+                  height: 45 
+                  bg_color: 0x000000
+                  border_width: 0  
+                  radius: 0
+                  pad_all: 0
+                  scrollbar_mode: "OFF"
+                  widgets:
+                    - label: { text: "▼", align: CENTER, text_font: font_huge, text_color: 0xFFA500 }
+                  on_press:
+                    - lambda: |-
+                        id(target_temp) = max(20.0f, id(target_temp) - 1.0f);
+                        lv_label_set_text_fmt(id(ui_target_temp), "%d°", (int)id(target_temp));
+                        id(save_data_script).execute();
+
+        - obj:
+            id: ui_bg_time_set
+            x: 165
+            y: 5
+            width: 110
+            height: 160
+            bg_color: 0x000000
+            border_width: 1
+            border_color: 0x444444
+            radius: 0
+            pad_all: 0
+            scrollbar_mode: "OFF"
+            widgets:
+              - obj: 
+                  align: TOP_MID
+                  width: 108 
+                  height: 45
+                  bg_color: 0x000000
+                  border_width: 0 
+                  radius: 0
+                  pad_all: 0
+                  scrollbar_mode: "OFF"
+                  widgets:
+                    - label: { text: "▲", align: CENTER, text_font: font_huge, text_color: 0xFFA500 }
+                  on_press:
+                    - lambda: |-
+                        if (id(aszalo_thermostat).mode == CLIMATE_MODE_HEAT) {
+                          int current_min = id(remaining_time_s) / 60;
+                          int rounded_min = ((current_min + 15) / 30) * 30;
+                          int new_min = min(1440, rounded_min + 30);
+                          
+                          id(remaining_time_s) = new_min * 60;
+                          id(target_time_min) = new_min; 
+                          
+                          lv_label_set_text_fmt(id(ui_target_time), "%02d:%02d", new_min / 60, new_min % 60);
+                          id(save_data_script).execute(); 
+                        } else {
+                          id(target_time_min) = min(1440, id(target_time_min) + 30);
+                          int t_min = id(target_time_min);
+                          lv_label_set_text_fmt(id(ui_target_time), "%02d:%02d", t_min / 60, t_min % 60);
+                          id(save_data_script).execute();
+                        }
+              - label: 
+                  id: ui_target_time
+                  text: "10:00"
+                  align: CENTER
+                  text_font: font_huge
+                  text_color: 0xFFFFFF
+              - obj: 
+                  align: BOTTOM_MID
+                  width: 108 
+                  height: 45
+                  bg_color: 0x000000
+                  border_width: 0 
+                  radius: 0
+                  pad_all: 0
+                  scrollbar_mode: "OFF"
+                  widgets:
+                    - label: { text: "▼", align: CENTER, text_font: font_huge, text_color: 0xFFA500 }
+                  on_press:
+                    - lambda: |-
+                        if (id(aszalo_thermostat).mode == CLIMATE_MODE_HEAT) {
+                          int current_min = id(remaining_time_s) / 60;
+                          int rounded_min = ((current_min + 15) / 30) * 30;
+                          int new_min = max(30, rounded_min - 30); 
+                          
+                          id(remaining_time_s) = new_min * 60;
+                          id(target_time_min) = new_min; 
+                          
+                          lv_label_set_text_fmt(id(ui_target_time), "%02d:%02d", new_min / 60, new_min % 60);
+                          id(save_data_script).execute(); 
+                        } else {
+                          id(target_time_min) = max(30, id(target_time_min) - 30);
+                          int t_min = id(target_time_min);
+                          lv_label_set_text_fmt(id(ui_target_time), "%02d:%02d", t_min / 60, t_min % 60);
+                          id(save_data_script).execute();
+                        }
+
+        - obj:
+            id: ui_bg_current_temp 
+            x: 45
+            y: 170 
+            width: 110
+            height: 65 
+            bg_color: 0x000000
+            border_width: 1
+            border_color: 0x444444
+            radius: 0
+            pad_all: 0
+            scrollbar_mode: "OFF"
+            widgets:
+              - label:
+                  id: ui_current_temp
+                  text: "--°"
+                  align: CENTER
+                  text_font: font_huge
+                  text_color: 0xFF0000 
+
+        - button:
+            id: ui_start_stop_btn
+            x: 165
+            y: 170 
+            width: 110
+            height: 65 
+            bg_color: 0x00FF00 
+            radius: 0
+            pad_all: 0
+            scrollbar_mode: "OFF"
+            widgets:
+              - label:
+                  id: ui_start_stop_label
+                  text: "Start"
+                  align: CENTER
+                  text_color: 0xFFFFFF
+                  text_font: font_huge
+            on_press:
+              - lambda: |-
+                  if (id(system_error_code) == 2) {
+                    id(system_error_code) = 0; 
+                    id(alarm_thermal_script).stop();  
+                    id(alarm_buzzer).stop();          
+                    id(fan_relay).turn_off();         
+                  }
+                  else if (id(aszalo_thermostat).mode == CLIMATE_MODE_HEAT) {
+                    id(offline_timer_script).stop(); 
+                    id(cool_down_script).execute();  
+                  } 
+                  else if (id(aszalo_thermostat).mode == CLIMATE_MODE_OFF && !id(fan_relay).state) {
+                    id(offline_timer_script).execute();
+                  } 
+                  else {
+                    id(cool_down_script).stop();
+                    id(fan_relay).turn_off();
+                  }
+        
+        - obj:
+            id: ui_boot_screen
+            x: 0
+            y: 0
+            width: 320 
+            height: 240
+            bg_color: 0x000000
+            radius: 0
+            border_width: 0
+            scrollbar_mode: "OFF"
+            widgets:
+              - label:
+                  id: ui_boot_label
+                  text: "Connecting..."
+                  align: CENTER
+                  y: -30
+                  text_align: CENTER
+                  text_color: 0xFFFFFF
+                  text_font: font_large
+              - button:
+                  id: ui_wifi_btn
+                  align: BOTTOM_MID
+                  y: -20
+                  width: 240
+                  height: 50
+                  bg_color: 0x444444
+                  radius: 5
+                  widgets:
+                    - label:
+                        text: "Change WiFi Network"
+                        align: CENTER
+                        text_color: 0xFFFFFF
+                        text_font: font_vert
+                  on_press:
+                    - lambda: 'id(wifi_setup_requested) = true;'
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          static int thermal_error_timer = 0;       
+          static int sensor_error_ticks = 0; 
+          
+          static float last_temp = -999.0;
+          static float last_target = -999.0;
+          static int last_mode = -1;
+          static int last_error = -1;
+          static int last_hum = -1;
+          static int last_intensity = -1;
+          static int last_rem_s = -1;
+          static bool last_fan = false;
+
+          float cur_temp = id(aszalo_temp).state;
+          float cur_target = id(target_temp);
+          int cur_mode = id(aszalo_thermostat).mode;
+          int cur_error = id(system_error_code);
+          bool cur_fan = id(fan_relay).state;
+          int cur_hum = (int)id(aszalo_hum).state;
+
+          if (!isnan(cur_temp)) {
+            sensor_error_ticks = 0; 
+            if (cur_error == 1) { id(system_error_code) = 0; cur_error = 0; }
+            
+            if (cur_mode == CLIMATE_MODE_HEAT) {
+              if (cur_temp >= (cur_target - 1.0f) && cur_temp <= (cur_target + 1.0f)) {
+                thermal_error_timer = 0; 
+              } else {
+                thermal_error_timer++;   
+              }
+              if (thermal_error_timer >= 1200) { 
+                id(system_error_code) = 2; cur_error = 2;
+                id(alarm_thermal_script).execute(); 
+                auto call = id(aszalo_thermostat).make_call();
+                call.set_mode(CLIMATE_MODE_OFF);
+                call.perform();
+                id(offline_timer_script).stop(); 
+                id(cool_down_script).stop();
+                id(fan_relay).turn_on(); 
+                thermal_error_timer = 0; 
+              }
+            } else {
+              thermal_error_timer = 0;
+            }
+
+            if (cur_error != 2) {
+              id(alarm_thermal_script).stop();
+              id(alarm_buzzer).stop();
+            }
+
+            if (cur_temp != last_temp || cur_target != last_target || cur_mode != last_mode) {
+              lv_label_set_text_fmt(id(ui_current_temp), "%d°", (int)cur_temp);
+              
+              if (cur_mode == CLIMATE_MODE_HEAT && cur_temp >= (cur_target - 1.0f) && cur_temp <= (cur_target + 1.0f)) {
+                lv_obj_set_style_bg_color(id(ui_bg_current_temp), lv_color_hex(0x008000), LV_PART_MAIN); 
+                lv_obj_set_style_text_color(id(ui_current_temp), lv_color_hex(0xFFFFFF), LV_PART_MAIN);  
+              } else {
+                lv_obj_set_style_bg_color(id(ui_bg_current_temp), lv_color_hex(0x000000), LV_PART_MAIN); 
+                lv_obj_set_style_text_color(id(ui_current_temp), lv_color_hex(0xFF0000), LV_PART_MAIN);  
+              }
+              last_temp = cur_temp;
+            }
+
+          } else {
+            sensor_error_ticks++;
+            if (sensor_error_ticks == 1) { 
+              lv_label_set_text(id(ui_current_temp), "Err");
+              lv_obj_set_style_bg_color(id(ui_bg_current_temp), lv_color_hex(0xFF0000), LV_PART_MAIN); 
+              lv_obj_set_style_text_color(id(ui_current_temp), lv_color_hex(0xFFFFFF), LV_PART_MAIN);  
+            }
+            if (sensor_error_ticks == 3) {
+              id(system_error_code) = 1; cur_error = 1;
+              id(alarm_sensor_script).execute();
+              if (cur_mode == CLIMATE_MODE_HEAT) {
+                auto call = id(aszalo_thermostat).make_call();
+                call.set_mode(CLIMATE_MODE_OFF);
+                call.perform();
+                id(offline_timer_script).stop(); 
+                id(cool_down_script).stop();
+                id(emergency_stop).execute(); 
+              }
+            }
+          }
+          
+          if (!isnan(id(aszalo_hum).state)) {
+            if (cur_hum != last_hum) {
+              lv_bar_set_value(id(ui_right_bar), cur_hum, LV_ANIM_OFF);
+              if (cur_hum <= 12) {
+                lv_obj_set_style_bg_color(id(ui_right_bar), lv_color_hex(0xFFFF00), LV_PART_INDICATOR); 
+                lv_obj_set_style_text_color(id(ui_right_bar_label), lv_color_hex(0x000000), LV_PART_MAIN); 
+              } else {
+                lv_obj_set_style_bg_color(id(ui_right_bar), lv_color_hex(0x0000FF), LV_PART_INDICATOR); 
+                lv_obj_set_style_text_color(id(ui_right_bar_label), lv_color_hex(0xFFFFFF), LV_PART_MAIN); 
+              }
+              lv_label_set_text_fmt(id(ui_right_bar_label), "%d\n%%\n\nH", cur_hum);
+              last_hum = cur_hum;
+            }
+          }
+
+          if (cur_target != last_target) {
+            lv_label_set_text_fmt(id(ui_target_temp), "%d°", (int)cur_target);
+            last_target = cur_target;
+          }
+
+          if (cur_mode != last_mode) {
+             if (cur_mode == CLIMATE_MODE_HEAT) {
+                lv_obj_set_style_bg_color(id(ui_start_stop_btn), lv_color_hex(0xFF0000), LV_PART_MAIN);
+                lv_label_set_text(id(ui_start_stop_label), "Stop");
+                lv_obj_set_style_bg_color(id(ui_bg_temp_set), lv_color_hex(0x008000), LV_PART_MAIN);
+                lv_obj_set_style_bg_color(id(ui_bg_time_set), lv_color_hex(0x008000), LV_PART_MAIN);
+             } else {
+                lv_obj_set_style_bg_color(id(ui_start_stop_btn), lv_color_hex(0x00FF00), LV_PART_MAIN);
+                lv_label_set_text(id(ui_start_stop_label), "Start");
+                lv_obj_set_style_bg_color(id(ui_bg_temp_set), lv_color_hex(0x000000), LV_PART_MAIN);
+                lv_obj_set_style_bg_color(id(ui_bg_time_set), lv_color_hex(0x000000), LV_PART_MAIN);
+             }
+             last_mode = cur_mode;
+          }
+
+          int cur_rem_s = (cur_mode == CLIMATE_MODE_HEAT) ? id(remaining_time_s) : (id(target_time_min) * 60);
+          if (cur_rem_s != last_rem_s) {
+             lv_label_set_text_fmt(id(ui_target_time), "%02d:%02d", cur_rem_s / 3600, (cur_rem_s % 3600) / 60);
+             last_rem_s = cur_rem_s;
+          }
+
+          int cur_intensity = 0;
+          if (cur_error != 2 && !(cur_fan && cur_mode == CLIMATE_MODE_OFF)) {
+             float raw_i = id(aszalo_thermostat).get_output_value() * 100.0f;
+             cur_intensity = (int)(std::max(0.0f, std::min(100.0f, raw_i)));
+          }
+
+          if (cur_error != last_error || cur_fan != last_fan || cur_intensity != last_intensity) {
+             if (cur_error == 2) {
+                lv_bar_set_value(id(ui_left_bar), 100, LV_ANIM_OFF);
+                lv_obj_set_style_bg_color(id(ui_left_bar), lv_color_hex(0xFF0000), LV_PART_INDICATOR); 
+                lv_label_set_text(id(ui_left_bar_label), "E\nR\nR\nO\nR");
+             } else if (cur_fan && cur_mode == CLIMATE_MODE_OFF) {
+                lv_bar_set_value(id(ui_left_bar), 100, LV_ANIM_OFF);
+                lv_obj_set_style_bg_color(id(ui_left_bar), lv_color_hex(0x0080FF), LV_PART_INDICATOR); 
+                lv_label_set_text(id(ui_left_bar_label), "C\nO\nO\nL\nI\nN\nG");
+             } else {
+                lv_bar_set_value(id(ui_left_bar), cur_intensity, LV_ANIM_OFF);
+                lv_obj_set_style_bg_color(id(ui_left_bar), lv_color_hex(0xFF0000), LV_PART_INDICATOR); 
+                if (cur_intensity == 100) {
+                    lv_label_set_text(id(ui_left_bar_label), "100\n%\n\nP");
+                } else {
+                    lv_label_set_text_fmt(id(ui_left_bar_label), "%d\n%%\n\nP", cur_intensity);
+                }
+             }
+             last_error = cur_error;
+             last_fan = cur_fan;
+             last_intensity = cur_intensity;
+          }
+
+}

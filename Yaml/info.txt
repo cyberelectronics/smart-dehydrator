@@ -1,0 +1,4 @@
+Add these files to your Esphome directory:
+
+Arial.ttf
+default_16MB.csv
